@@ -29,7 +29,9 @@ import (
 	"github.com/newrelic/infrastructure-agent/internal/integrations/v4/files"
 	"github.com/newrelic/infrastructure-agent/internal/integrations/v4/integration"
 	"github.com/newrelic/infrastructure-agent/internal/integrations/v4/v3legacy"
-	"github.com/newrelic/infrastructure-agent/pkg/integrations/stoppable"
+	"github.com/newrelic/infrastructure-agent/internal/socketapi"
+	"github.com/newrelic/infrastructure-agent/pkg/integrations/track"
+	"github.com/newrelic/infrastructure-agent/pkg/plugins"
 	"github.com/sirupsen/logrus"
 
 	"github.com/newrelic/infrastructure-agent/cmd/newrelic-infra/initialize"
@@ -50,7 +52,6 @@ import (
 	"github.com/newrelic/infrastructure-agent/pkg/integrations/v4/emitter"
 	"github.com/newrelic/infrastructure-agent/pkg/integrations/v4/logs"
 	wlog "github.com/newrelic/infrastructure-agent/pkg/log"
-	"github.com/newrelic/infrastructure-agent/pkg/plugins"
 	"github.com/newrelic/infrastructure-agent/pkg/trace"
 )
 
@@ -231,40 +232,13 @@ func initializeAgentAndRun(c *config.Config, logFwCfg config.LogForward) error {
 	ffManager := feature_flags.NewManager(c.Features)
 	il := newInstancesLookup(integrationCfg)
 
-	// queues integration run requests
-	definitionQ := make(chan integration.Definition, 100)
-
-	tracker := stoppable.NewTracker()
-
-	// Command channel handlers
-	backoffSecsC := make(chan int, 1) // 1 won't block on initial cmd-channel fetch
-	boHandler := ccBackoff.NewHandler(backoffSecsC)
-	ffHandle := fflag.NewHandler(c, ffManager, wlog.WithComponent("FFHandler"))
-	ffHandler := cmdchannel.NewCmdHandler("set_feature_flag", ffHandle.Handle)
-	riHandler := runintegration.NewHandler(definitionQ, il, wlog.WithComponent("runintegration.Handler"))
-	siHandler := stopintegration.NewHandler(tracker, wlog.WithComponent("stopintegration.Handler"))
-	// Command channel service
-	ccService := service.NewService(
-		caClient,
-		c.CommandChannelIntervalSec,
-		backoffSecsC,
-		boHandler,
-		ffHandler,
-		riHandler,
-		siHandler,
-	)
-	initCmdResponse, err := ccService.InitialFetch(context.Background())
-	if err != nil {
-		aslog.WithError(err).Warn("Commands initial fetch failed.")
-	}
-
 	fatal := func(err error, message string) {
 		aslog.WithError(err).Error(message)
 		os.Exit(1)
 	}
 
 	aslog.Info("Checking network connectivity...")
-	err = waitForNetwork(c.CollectorURL, c.StartupConnectionTimeout, c.StartupConnectionRetries, transport)
+	err := waitForNetwork(c.CollectorURL, c.StartupConnectionTimeout, c.StartupConnectionRetries, transport)
 	if err != nil {
 		fatal(err, "Can't reach the New Relic collector.")
 	}
@@ -305,26 +279,57 @@ func initializeAgentAndRun(c *config.Config, logFwCfg config.LogForward) error {
 		fatal(err, "Can't complete platform specific initialization.")
 	}
 
-	// Start all plugins we want the agent to run.
-	if err = plugins.RegisterPlugins(agt); err != nil {
-		aslog.WithError(err).Error("fatal error while registering plugins")
-		os.Exit(1)
-	}
-
 	metricsSenderConfig := dm.NewConfig(c.MetricURL, c.License, time.Duration(c.DMSubmissionPeriod)*time.Second, c.MaxMetricBatchEntitiesCount, c.MaxMetricBatchEntitiesQueue)
 	dmSender, err := dm.NewDMSender(metricsSenderConfig, transport, agt.Context.IdContext().AgentIdentity)
 	if err != nil {
 		return err
 	}
 
-	var dmEmitter dm.Emitter
-	if enabled, exists := ffManager.GetFeatureFlag(fflag.FlagDMRegisterEnable); exists && enabled {
-		dmEmitter = dm.NewEmitter(agt.GetContext(), dmSender, registerClient)
-	} else {
-		dmEmitter = dm.NewNonRegisterEmitter(agt.GetContext(), dmSender)
-	}
+	// queues integration run requests
+	definitionQ := make(chan integration.Definition, 100)
+
+	emitterWithRegister := dm.NewEmitter(agt.GetContext(), dmSender, registerClient)
+	nonRegisterEmitter := dm.NewNonRegisterEmitter(agt.GetContext(), dmSender)
+
+	dmEmitter := dm.NewEmitterWithFF(emitterWithRegister, nonRegisterEmitter, ffManager)
+
+	// track stoppable integrations
+	tracker := track.NewTracker(dmEmitter)
+
 	integrationEmitter := emitter.NewIntegrationEmittor(agt, dmEmitter, ffManager)
 	integrationManager := v4.NewManager(integrationCfg, integrationEmitter, il, definitionQ, tracker)
+
+	// Command channel handlers
+	backoffSecsC := make(chan int, 1) // 1 won't block on initial cmd-channel fetch
+	boHandler := ccBackoff.NewHandler(backoffSecsC)
+	ffHandle := fflag.NewHandler(c, ffManager, wlog.WithComponent("FFHandler"))
+	ffHandler := cmdchannel.NewCmdHandler("set_feature_flag", ffHandle.Handle)
+	riHandler := runintegration.NewHandler(definitionQ, il, dmEmitter, wlog.WithComponent("runintegration.Handler"))
+	siHandler := stopintegration.NewHandler(tracker, il, dmEmitter, wlog.WithComponent("stopintegration.Handler"))
+	// Command channel service
+	ccService := service.NewService(
+		caClient,
+		c.CommandChannelIntervalSec,
+		backoffSecsC,
+		boHandler,
+		ffHandler,
+		riHandler,
+		siHandler,
+	)
+	initCmdResponse, err := ccService.InitialFetch(context.Background())
+	if err != nil {
+		aslog.WithError(err).Warn("Commands initial fetch failed.")
+	}
+
+	if c.TCPServerEnabled {
+		go socketapi.NewServer(integrationEmitter, c.TCPServerPort).Serve(agt.Context.Ctx)
+	}
+
+	// Start all plugins we want the agent to run.
+	if err = plugins.RegisterPlugins(agt, integrationEmitter); err != nil {
+		aslog.WithError(err).Error("fatal error while registering plugins")
+		os.Exit(1)
+	}
 
 	// log-forwarder
 	fbIntCfg := v4.FBSupervisorConfig{
@@ -508,8 +513,7 @@ func checkEndpointReachable(
 	transport http.RoundTripper) (timedOut bool, err error) {
 	var request *http.Request
 	if request, err = http.NewRequest("HEAD", collectorURL, nil); err != nil {
-		aslog.WithError(err).Debug("Unable to prepare availability request.")
-		return false, fmt.Errorf("Unable to prepare availability request: %v", request)
+		return false, fmt.Errorf("unable to prepare reachability request: %v, error: %s", request, err)
 	}
 
 	client := backendhttp.GetHttpClient(timeout, transport)

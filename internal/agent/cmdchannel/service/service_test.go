@@ -21,6 +21,7 @@ import (
 	"github.com/newrelic/infrastructure-agent/internal/integrations/v4/integration"
 	http2 "github.com/newrelic/infrastructure-agent/pkg/backend/http"
 	"github.com/newrelic/infrastructure-agent/pkg/entity"
+	dm "github.com/newrelic/infrastructure-agent/pkg/integrations/v4/dm/testutils"
 	"github.com/newrelic/infrastructure-agent/pkg/log"
 	"github.com/stretchr/testify/require"
 
@@ -135,7 +136,7 @@ func TestSrv_InitialFetch_EnablesRegisterAndHandlesBackoff(t *testing.T) {
 	assert.True(t, c.RegisterEnabled)
 }
 
-func TestSrv_InitialFetch_HandlesRunIntegration(t *testing.T) {
+func TestSrv_InitialFetch_HandlesRunIntegrationAndMetadata(t *testing.T) {
 	serializedCmds := `
 	{
 		"return_value": [
@@ -143,6 +144,10 @@ func TestSrv_InitialFetch_HandlesRunIntegration(t *testing.T) {
 				"name": "run_integration",
 				"arguments": {
 					"integration_name": "nri-foo"
+				},
+				"metadata": {
+					"target_pid": 123,
+					"target_strategy": "<STRATEGY>"
 				}
 			}
 		]
@@ -154,7 +159,7 @@ func TestSrv_InitialFetch_HandlesRunIntegration(t *testing.T) {
 			return "/path/to/nri-foo", nil
 		},
 	}
-	h := runintegration.NewHandler(defQueue, il, l)
+	h := runintegration.NewHandler(defQueue, il, dm.NewNoopEmitter(), l)
 
 	s := NewService(cmdchanneltest.SuccessClient(serializedCmds), 1, make(chan int, 1), h)
 
@@ -163,6 +168,11 @@ func TestSrv_InitialFetch_HandlesRunIntegration(t *testing.T) {
 
 	d := <-defQueue
 	assert.Equal(t, "nri-foo", d.Name)
+	require.NotNil(t, d.CmdChanReq)
+	require.Contains(t, d.CmdChanReq.Metadata, "target_pid")
+	require.Contains(t, d.CmdChanReq.Metadata, "target_strategy")
+	assert.Equal(t, float64(123), d.CmdChanReq.Metadata["target_pid"])
+	assert.Equal(t, "<STRATEGY>", d.CmdChanReq.Metadata["target_strategy"])
 }
 
 func TestSrv_Run(t *testing.T) {
@@ -284,13 +294,14 @@ func TestSrv_Run_HandlesRunIntegrationAndACKs(t *testing.T) {
 			return "/path/to/nri-foo", nil
 		},
 	}
-	h := runintegration.NewHandler(defQueue, il, l)
+	h := runintegration.NewHandler(defQueue, il, dm.NewNoopEmitter(), l)
 
 	cmd := `
 	{
 		"return_value": [
 			{
-				"id":   1,
+				"id":   0,
+				"hash": "xyz",
 				"name": "run_integration",
 				"arguments": {
 					"integration_name": "nri-foo"
@@ -313,8 +324,8 @@ func TestSrv_Run_HandlesRunIntegrationAndACKs(t *testing.T) {
 	req2 := <-requestsCh
 	cancel()
 
-	assert.Equal(t, http.MethodGet, req1.Method, "get-commands request is expected")
-	assert.Equal(t, http.MethodPost, req2.Method, "ack post submission is expected")
+	assert.Equal(t, http.MethodGet, req1.Method, "GET commands request is expected")
+	assert.Equal(t, http.MethodPost, req2.Method, "POST ack submission is expected")
 
 	d := <-defQueue
 	assert.Equal(t, "nri-foo", d.Name)

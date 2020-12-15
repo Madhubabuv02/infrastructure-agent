@@ -80,10 +80,16 @@ func NewRunner(
 	return r
 }
 
-func (r *runner) Run(ctx context.Context, pidWChan chan<- int) {
+func (r *runner) Run(ctx context.Context, pidWCh, exitCodeCh chan<- int) {
 	r.log = illog.WithFields(LogFields(r.definition))
 	for {
 		waitForNextExecution := time.After(r.definition.Interval)
+
+		// only cmd-channel run-requests require exit-code, and they only trigger a single instance
+		//var exitCodeCh chan int
+		//if r.definition.RequiresEvent() {
+		//	exitCodeCh = make(chan int, 1)
+		//}
 
 		values, err := r.applyDiscovery()
 		if err != nil {
@@ -92,13 +98,18 @@ func (r *runner) Run(ctx context.Context, pidWChan chan<- int) {
 				Error("can't fetch discovery items")
 		} else {
 			if when.All(r.definition.WhenConditions...) {
-				r.execute(ctx, values, pidWChan)
+				r.execute(ctx, values, pidWCh, exitCodeCh)
 			}
+		}
+
+		if r.definition.SingleRun() {
+			r.log.Debug("Integration single run finished")
+			return
 		}
 
 		select {
 		case <-ctx.Done():
-			r.log.Debug("Integration has been interrupted. Finishing.")
+			r.log.Debug("Integration has been interrupted")
 			return
 		case <-waitForNextExecution:
 		}
@@ -148,7 +159,7 @@ func (r *runner) heartBeat() {
 // to finish
 // For long-time running integrations, avoids starting the next
 // discover-execute cycle until all the parallel processes have ended
-func (r *runner) execute(ctx context.Context, matches *databind.Values, pidWChan chan<- int) {
+func (r *runner) execute(ctx context.Context, matches *databind.Values, pidWCh, exitCodeCh chan<- int) {
 	def := r.definition
 
 	// If timeout configuration is set, wraps current context in a heartbeat-enabled timeout context
@@ -159,7 +170,7 @@ func (r *runner) execute(ctx context.Context, matches *databind.Values, pidWChan
 	}
 
 	// Runs all the matching integration instances
-	outputs, err := r.definition.Run(ctx, matches, pidWChan)
+	outputs, err := r.definition.Run(ctx, matches, pidWCh, exitCodeCh)
 	if err != nil {
 		r.log.WithError(err).Error("can't start integration")
 		return
@@ -262,7 +273,6 @@ func (r *runner) handleLines(stdout <-chan []byte, extraLabels data.Map, entityR
 			continue
 		}
 
-		llog.Debug("Received payload.")
 		err := r.emitter.Emit(r.definition, extraLabels, entityRewrite, line)
 		if err != nil {
 			llog.WithError(err).Warn("Cannot emit integration payload")
